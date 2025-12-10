@@ -4,59 +4,85 @@ import pandas as pd
 from ortools.sat.python import cp_model
 import os
 
+import json
+
 # --- 1. Data Storage & Initialization ---
 
 DB_FILE = 'db.json'
-db = TinyDB(DB_FILE)
+
+def get_db():
+    """Safely get the TinyDB instance, handling corruption."""
+    try:
+        return TinyDB(DB_FILE)
+    except Exception:
+        # If DB is corrupted, remove it and return a new instance
+        if os.path.exists(DB_FILE):
+            os.remove(DB_FILE)
+        return TinyDB(DB_FILE)
+
+db = get_db()
 staff_table = db.table('staff')
 
 def init_db(force_reset=False):
     """
     Seeds the database with V3 data including 'flexible_hours' and 'preferred_shifts'.
+    Handles corrupted JSON files by resetting.
     """
-    # Check for migration needs
-    needs_migration = False
-    if len(staff_table.all()) > 0:
-        first_record = staff_table.all()[0]
-        if 'flexible_hours' not in first_record or 'preferred_shifts' not in first_record:
-            needs_migration = True
+    global db, staff_table
+    
+    try:
+        # Check for migration needs
+        needs_migration = False
+        if len(staff_table.all()) > 0:
+            first_record = staff_table.all()[0]
+            if 'flexible_hours' not in first_record or 'preferred_shifts' not in first_record:
+                needs_migration = True
 
-    if force_reset or len(staff_table.all()) == 0 or needs_migration:
-        db.drop_table('staff')
-        
-        staff_data = []
-        
-        # General Manager
-        staff_data.append({
-            'name': 'Daniel', 'role': 'General Manager', 'type': 'Full Time', 'max_hours': 40,
-            'flexible_hours': False, 'preferred_shifts': ['Opening', 'Middle']
-        })
-        
-        # Managers
-        for name in ['Pavan', 'Dana', 'Misrak']:
+        if force_reset or len(staff_table.all()) == 0 or needs_migration:
+            db.drop_table('staff')
+            
+            staff_data = []
+            
+            # General Manager
             staff_data.append({
-                'name': name, 'role': 'Manager', 'type': 'Full Time', 'max_hours': 40,
-                'flexible_hours': False, 'preferred_shifts': ['Opening', 'Closing']
+                'name': 'Daniel', 'role': 'General Manager', 'type': 'Full Time', 'max_hours': 40,
+                'flexible_hours': False, 'preferred_shifts': ['Opening', 'Middle']
             })
             
-        # Full Time Staff
-        for name in ['Eddy', 'Hein', 'Sancia', 'Liban', 'Omya', 'Jacquline']:
-            staff_data.append({
-                'name': name, 'role': 'Staff', 'type': 'Full Time', 'max_hours': 40,
-                'flexible_hours': False, 'preferred_shifts': ['Middle', 'Closing']
-            })
+            # Managers
+            for name in ['Pavan', 'Dana', 'Misrak']:
+                staff_data.append({
+                    'name': name, 'role': 'Manager', 'type': 'Full Time', 'max_hours': 40,
+                    'flexible_hours': False, 'preferred_shifts': ['Opening', 'Closing']
+                })
+                
+            # Full Time Staff
+            for name in ['Eddy', 'Hein', 'Sancia', 'Liban', 'Omya', 'Jacquline']:
+                staff_data.append({
+                    'name': name, 'role': 'Staff', 'type': 'Full Time', 'max_hours': 40,
+                    'flexible_hours': False, 'preferred_shifts': ['Middle', 'Closing']
+                })
+                
+            # Part Time Staff (Flexible)
+            for name in ['Htet', 'Naing', 'Dharani', 'Freya', 'Abby']:
+                staff_data.append({
+                    'name': name, 'role': 'Staff', 'type': 'Part Time', 'max_hours': 20,
+                    'flexible_hours': True, 'preferred_shifts': ['Peak_Lunch', 'Peak_Dinner', 'Closing']
+                })
+                
+            staff_table.insert_multiple(staff_data)
             
-        # Part Time Staff (Flexible)
-        for name in ['Htet', 'Naing', 'Dharani', 'Freya', 'Abby']:
-            staff_data.append({
-                'name': name, 'role': 'Staff', 'type': 'Part Time', 'max_hours': 20,
-                'flexible_hours': True, 'preferred_shifts': ['Peak_Lunch', 'Peak_Dinner', 'Closing']
-            })
+            msg = "Database reset to V3 schema!" if force_reset else "Database initialized with V3 schema."
+            st.toast(msg, icon="🚀")
             
-        staff_table.insert_multiple(staff_data)
-        
-        msg = "Database reset to V3 schema!" if force_reset else "Database initialized with V3 schema."
-        st.toast(msg, icon="🚀")
+    except Exception as e:
+        st.error(f"Database error detected: {e}. Resetting database...")
+        if os.path.exists(DB_FILE):
+            os.remove(DB_FILE)
+        # Re-initialize globals
+        db = TinyDB(DB_FILE)
+        staff_table = db.table('staff')
+        init_db(force_reset=True)
 
 # Initialize DB
 init_db()
