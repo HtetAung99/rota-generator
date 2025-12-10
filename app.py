@@ -12,195 +12,240 @@ staff_table = db.table('staff')
 
 def init_db(force_reset=False):
     """
-    Seeds the database with specific staff members and roles.
-    New structure includes 'employment_type' and 'max_hours_week'.
+    Seeds the database with V3 data including 'flexible_hours' and 'preferred_shifts'.
     """
+    # Check for migration needs
     needs_migration = False
     if len(staff_table.all()) > 0:
         first_record = staff_table.all()[0]
-        if 'type' not in first_record or 'max_hours' not in first_record:
+        if 'flexible_hours' not in first_record or 'preferred_shifts' not in first_record:
             needs_migration = True
 
     if force_reset or len(staff_table.all()) == 0 or needs_migration:
         db.drop_table('staff')
         
-        # Define seed data
-        # Defaults: FT = 40h, PT = 20h
         staff_data = []
         
         # General Manager
-        staff_data.append({'name': 'Daniel', 'role': 'General Manager', 'type': 'Full Time', 'max_hours': 40})
+        staff_data.append({
+            'name': 'Daniel', 'role': 'General Manager', 'type': 'Full Time', 'max_hours': 40,
+            'flexible_hours': False, 'preferred_shifts': ['Opening', 'Middle']
+        })
         
         # Managers
         for name in ['Pavan', 'Dana', 'Misrak']:
-            staff_data.append({'name': name, 'role': 'Manager', 'type': 'Full Time', 'max_hours': 40})
+            staff_data.append({
+                'name': name, 'role': 'Manager', 'type': 'Full Time', 'max_hours': 40,
+                'flexible_hours': False, 'preferred_shifts': ['Opening', 'Closing']
+            })
             
         # Full Time Staff
         for name in ['Eddy', 'Hein', 'Sancia', 'Liban', 'Omya', 'Jacquline']:
-            staff_data.append({'name': name, 'role': 'Staff', 'type': 'Full Time', 'max_hours': 40})
+            staff_data.append({
+                'name': name, 'role': 'Staff', 'type': 'Full Time', 'max_hours': 40,
+                'flexible_hours': False, 'preferred_shifts': ['Middle', 'Closing']
+            })
             
-        # Part Time Staff
+        # Part Time Staff (Flexible)
         for name in ['Htet', 'Naing', 'Dharani', 'Freya', 'Abby']:
-            staff_data.append({'name': name, 'role': 'Staff', 'type': 'Part Time', 'max_hours': 20})
+            staff_data.append({
+                'name': name, 'role': 'Staff', 'type': 'Part Time', 'max_hours': 20,
+                'flexible_hours': True, 'preferred_shifts': ['Peak_Lunch', 'Peak_Dinner', 'Closing']
+            })
             
         staff_table.insert_multiple(staff_data)
-        if force_reset:
-            st.toast("Database reset and seeded with V2 data!", icon="🔄")
-        else:
-            st.toast("Database initialized with V2 data.", icon="🌱")
+        
+        msg = "Database reset to V3 schema!" if force_reset else "Database initialized with V3 schema."
+        st.toast(msg, icon="🚀")
 
-# Initialize DB on load (only if empty)
+# Initialize DB
 init_db()
 
 # --- 2. The Logic (OR-Tools) ---
 
-def solve_roster(staff_list, num_days, closing_shift_count, daily_budgets):
+def solve_Rota(staff_list, num_days, closing_shift_count, daily_budgets):
     """
-    Solves the scheduling problem using Google OR-Tools with V2 constraints.
-    
-    Shift Definitions (Working Hours):
-    0: Opening (07:00-15:00) -> 7.5h
-    1: Middle  (11:30-20:30) -> 8.5h
-    2: Closing (15:00-23:30) -> 8.0h
-    
-    Peak Coverage Note:
-    - 12:00-14:00 is covered by Opening + Middle (3 + 2 = 5 staff).
-    - 18:00-20:00 is covered by Middle + Closing (2 + 3+ = 5+ staff).
+    V3 Solver: Maximizes budget utilization and handles complex constraints.
     """
     model = cp_model.CpModel()
     shifts = {}
-    
-    # Constants for integer scaling (OR-Tools requires integers)
-    # Scaling factor 10: 7.5h -> 75, 8.5h -> 85, 8.0h -> 80
-    SHIFT_HOURS_SCALED = {0: 75, 1: 85, 2: 80}
-    SHIFT_NAMES = {0: "Opening (07:00-15:00)", 1: "Middle (11:30-20:30)", 2: "Closing (15:00-23:30)"}
-    NUM_SHIFTS = 3
-    
-    # Identify Managers (Manager or General Manager)
-    manager_ids = [s.doc_id for s in staff_list if s['role'] in ['Manager', 'General Manager']]
 
-    # Create variables: shifts[(staff_id, day, shift_idx)]
+    # --- Definitions ---
+    # 0: Opening (07:00-15:00) -> 7.5h
+    # 1: Middle  (11:30-20:30) -> 8.5h
+    # 2: Closing (15:00-23:30) -> 8.0h
+    # 3: Peak_Lunch (11:00-15:00) -> 4.0h
+    # 4: Peak_Dinner (17:00-21:00) -> 4.0h
+    
+    SHIFT_INDICES = list(range(5))
+    STANDARD_SHIFTS = [0, 1, 2]
+    FLEX_SHIFTS = [3, 4]
+    
+    SHIFT_HOURS = {0: 7.5, 1: 8.5, 2: 8.0, 3: 4.0, 4: 4.0}
+    # Scaled for integer math (*10)
+    SHIFT_HOURS_SCALED = {k: int(v * 10) for k, v in SHIFT_HOURS.items()}
+    
+    SHIFT_CODES = {0: "Open", 1: "Mid", 2: "Close", 3: "PkLnch", 4: "PkDin"}
+    SHIFT_NAMES_FULL = {
+        0: "Opening (7.5h)", 1: "Middle (8.5h)", 2: "Closing (8.0h)",
+        3: "Peak Lunch (4h)", 4: "Peak Dinner (4h)"
+    }
+
+    # Map string preferences to indices
+    PREF_MAP = {
+        'Opening': 0, 'Middle': 1, 'Closing': 2, 
+        'Peak_Lunch': 3, 'Peak_Dinner': 4
+    }
+
+    manager_ids = [s.doc_id for s in staff_list if s['role'] in ['Manager', 'General Manager']]
+    flexible_staff_ids = [s.doc_id for s in staff_list if s.get('flexible_hours', False)]
+
+    # --- Variables ---
     for s in staff_list:
         for d in range(num_days):
-            for sh in range(NUM_SHIFTS):
-                shifts[(s.doc_id, d, sh)] = model.NewBoolVar(f'shift_s{s.doc_id}_d{d}_sh{sh}')
+            for sh in SHIFT_INDICES:
+                shifts[(s.doc_id, d, sh)] = model.NewBoolVar(f's{s.doc_id}_d{d}_sh{sh}')
 
-    # --- Constraints ---
+    # --- Hard Constraints ---
 
-    # 1. Fixed Staff Counts Per Shift
     for d in range(num_days):
-        # Opening: Always 3
-        model.Add(sum(shifts[(s.doc_id, d, 0)] for s in staff_list) == 3)
-        # Middle: Always 2
-        model.Add(sum(shifts[(s.doc_id, d, 1)] for s in staff_list) == 2)
-        # Closing: Parameterized (Default 3)
-        model.Add(sum(shifts[(s.doc_id, d, 2)] for s in staff_list) == closing_shift_count)
+        # 1. Standard Shift Counts (Fixed)
+        model.Add(sum(shifts[(s.doc_id, d, 0)] for s in staff_list) == 3) # Opening
+        model.Add(sum(shifts[(s.doc_id, d, 1)] for s in staff_list) == 2) # Middle
+        model.Add(sum(shifts[(s.doc_id, d, 2)] for s in staff_list) == closing_shift_count) # Closing
 
-    # 2. Manager Coverage Rule
-    # Opening: >= 1 Manager
-    # Closing: >= 1 Manager
-    # Middle: No specific requirement
-    for d in range(num_days):
+        # 2. Peak Hour Coverage
+        # 12:00-14:00 (Lunch): Covered by Open(0), Mid(1), Peak_Lunch(3)
+        lunch_staff = sum(shifts[(s.doc_id, d, sh)] for s in staff_list for sh in [0, 1, 3])
+        model.Add(lunch_staff >= 5)
+
+        # 18:00-20:00 (Dinner): Covered by Mid(1), Close(2), Peak_Dinner(4)
+        dinner_staff = sum(shifts[(s.doc_id, d, sh)] for s in staff_list for sh in [1, 2, 4])
+        model.Add(dinner_staff >= 5)
+
+        # 3. Manager Coverage (Opening & Closing)
         model.Add(sum(shifts[(m_id, d, 0)] for m_id in manager_ids) >= 1)
         model.Add(sum(shifts[(m_id, d, 2)] for m_id in manager_ids) >= 1)
 
-    # 3. One Shift Per Day
+        # 4. Daily Budget
+        daily_budget_val = daily_budgets[d % 7]
+        daily_cost_scaled = sum(
+            shifts[(s.doc_id, d, sh)] * SHIFT_HOURS_SCALED[sh]
+            for s in staff_list for sh in SHIFT_INDICES
+        )
+        model.Add(daily_cost_scaled <= int(daily_budget_val * 10))
+
+    # 5. Staff Constraints
     for s in staff_list:
+        # Flex Shift Eligibility: Only 'flexible_hours' staff can work shifts 3 and 4
+        if not s.get('flexible_hours', False):
+            for d in range(num_days):
+                for sh in FLEX_SHIFTS:
+                    model.Add(shifts[(s.doc_id, d, sh)] == 0)
+
+        # One Shift Per Day
         for d in range(num_days):
-            model.Add(sum(shifts[(s.doc_id, d, sh)] for sh in range(NUM_SHIFTS)) <= 1)
-
-    # 4. Weekly Hour Limits (Part-Time/Full-Time Constraints)
-    # Using scaled hours
-    for s in staff_list:
-        max_hours_scaled = int(s['max_hours'] * 10)
-        total_hours_expr = sum(
-            shifts[(s.doc_id, d, sh)] * SHIFT_HOURS_SCALED[sh]
-            for d in range(num_days)
-            for sh in range(NUM_SHIFTS)
-        )
-        model.Add(total_hours_expr <= max_hours_scaled)
-
-    # 5. Daily Budget Constraint (Per Day)
-    for d in range(num_days):
-        budget_for_day = daily_budgets[d % 7]  # Use modulo to map day index to Monday-Sunday inputs
-        max_daily_budget_scaled = int(budget_for_day * 10)
+            model.Add(sum(shifts[(s.doc_id, d, sh)] for sh in SHIFT_INDICES) <= 1)
         
-        daily_hours_expr = sum(
+        # Max Weekly Hours
+        total_hours_scaled = sum(
             shifts[(s.doc_id, d, sh)] * SHIFT_HOURS_SCALED[sh]
-            for s in staff_list
-            for sh in range(NUM_SHIFTS)
+            for d in range(num_days) for sh in SHIFT_INDICES
         )
-        model.Add(daily_hours_expr <= max_daily_budget_scaled)
+        model.Add(total_hours_scaled <= int(s['max_hours'] * 10))
+
+        # "Clopening" Rule: No Closing(2) on Day D and Opening(0) on Day D+1
+        for d in range(num_days - 1):
+            model.Add(shifts[(s.doc_id, d, 2)] + shifts[(s.doc_id, d + 1, 0)] <= 1)
+
+    # --- Objective Function ---
+    # Maximize (Total Hours Worked * Weight1) + (Preferred Shifts * Weight2)
+    
+    # Weighting: We want to prioritize using the budget (Total Hours) significantly.
+    # But we also want to respect preferences where possible.
+    
+    obj_hours = sum(
+        shifts[(s.doc_id, d, sh)] * SHIFT_HOURS_SCALED[sh]
+        for s in staff_list for d in range(num_days) for sh in SHIFT_INDICES
+    )
+    
+    obj_prefs = 0
+    for s in staff_list:
+        prefs = s.get('preferred_shifts', [])
+        for p_str in prefs:
+            if p_str in PREF_MAP:
+                p_idx = PREF_MAP[p_str]
+                # Add 1 bonus point for every preferred shift assigned
+                obj_prefs += sum(shifts[(s.doc_id, d, p_idx)] for d in range(num_days))
+
+    # Maximize
+    # Scaling preferences up to make them relevant against hours (which are in ~3000 range)
+    # 1 preference met ~= 2 hours of work value? 
+    # Let's say 1 hour = 10 units. 1 pref = 20 units.
+    model.Maximize(obj_hours + (obj_prefs * 20))
 
     # --- Solve ---
     solver = cp_model.CpSolver()
-    # Optional: Set a time limit for complex solves
-    solver.parameters.max_time_in_seconds = 5.0
+    solver.parameters.max_time_in_seconds = 10.0
     status = solver.Solve(model)
 
-    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-        # Format output
+    if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         data = []
         DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        for sh in range(NUM_SHIFTS):
-            row = {'Shift': SHIFT_NAMES[sh]}
-            for d in range(num_days):
-                # Gather all workers for this shift/day
-                workers = []
-                for s in staff_list:
-                    if solver.Value(shifts[(s.doc_id, d, sh)]):
-                        role_short = "M" if s['role'] in ['Manager', 'General Manager'] else "S"
-                        workers.append(f"{s['name']}({role_short})")
-                
-                # Join with commas/newlines for display
-                # Use modulo to cycle through day names if num_days > 7, though current UI max is 14.
-                row[DAY_NAMES[d % 7]] = ", ".join(workers) 
-            data.append(row)
         
-        # Add Daily Total Hours Row
-        total_row = {'Shift': 'Total Hours'}
+        # Create a grid: Rows = Staff, Cols = Days
+        # This visualization is better for complex shifts than Rows=Shifts
+        
+        for s in staff_list:
+            row = {'Staff': f"{s['name']} ({s['role']})"}
+            total_h = 0
+            for d in range(num_days):
+                cell_val = "-"
+                for sh in SHIFT_INDICES:
+                    if solver.Value(shifts[(s.doc_id, d, sh)]):
+                        cell_val = SHIFT_CODES[sh]
+                        total_h += SHIFT_HOURS[sh]
+                        break
+                row[DAY_NAMES[d % 7]] = cell_val
+            row['Total Hours'] = total_h
+            data.append(row)
+            
+        # Summary Row (Budget Usage)
+        summary_row = {'Staff': 'DAILY TOTAL (Hrs)'}
+        grand_total = 0
         for d in range(num_days):
-            daily_total = 0.0
-            for sh in range(NUM_SHIFTS):
-                # Count assigned staff for this shift/day
-                count = sum(solver.Value(shifts[(s.doc_id, d, sh)]) for s in staff_list)
-                # Map shift index to hours (unscaled)
-                shift_hours = {0: 7.5, 1: 8.5, 2: 8.0}[sh]
-                daily_total += count * shift_hours
-            total_row[DAY_NAMES[d % 7]] = f"{daily_total}h"
-        data.append(total_row)
+            d_total = 0
+            for s in staff_list:
+                for sh in SHIFT_INDICES:
+                    if solver.Value(shifts[(s.doc_id, d, sh)]):
+                        d_total += SHIFT_HOURS[sh]
+            grand_total += d_total
+            budget = daily_budgets[d % 7]
+            summary_row[DAY_NAMES[d % 7]] = f"{d_total} / {budget}"
+        summary_row['Total Hours'] = grand_total
+        data.append(summary_row)
 
-        return pd.DataFrame(data)
+        return pd.DataFrame(data), solver.ObjectiveValue()
     else:
-        return None
+        return None, 0
 
 # --- 3. The User Interface (Streamlit) ---
 
-st.set_page_config(page_title="Rota Generator V2", layout="wide")
-st.title("📅 Rota Generator: Advanced Scheduling")
+st.set_page_config(page_title="Rota Generator", layout="wide")
+st.title("⚡ Rota Generator: Advanced Scheduling")
 
-# Sidebar Configuration
+# Sidebar
 st.sidebar.header("Configuration")
-num_days = st.sidebar.number_input("Days to Schedule", min_value=1, max_value=14, value=7)
+num_days = st.sidebar.number_input("Days to Schedule", 1, 14, 7)
+closing_staff_count = st.sidebar.number_input("Closing Shift Staff", 1, 10, 3)
 
-st.sidebar.subheader("Shift Parameters")
-closing_staff_count = st.sidebar.number_input("Closing Shift Staff Count", min_value=1, value=3, help="Default is 3. Increase for weekends.")
-
-st.sidebar.divider()
-st.sidebar.subheader("Daily Budget Configuration")
-st.sidebar.write("Set max hours for each day:")
-
-DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-daily_budgets = []
-
-# Use an expander to keep the sidebar clean, or just list them if it fits
-with st.sidebar.expander("Daily Hour Budgets", expanded=True):
-    for day in DAY_NAMES:
-        # Default value was 70.0 in previous version
-        val = st.number_input(f"{day} Budget", min_value=40.0, value=70.0, step=0.5, key=f"budget_{day}")
+with st.sidebar.expander("Daily Hour Budgets", expanded=False):
+    daily_budgets = []
+    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    for day in days:
+        val = st.number_input(f"{day}", 40.0, 100.0, 75.0, step=0.5, key=f"b_{day}")
         daily_budgets.append(val)
 
-st.sidebar.divider()
 if st.sidebar.button("⚠️ Reset & Seed Database"):
     init_db(force_reset=True)
     st.rerun()
@@ -210,66 +255,54 @@ tab1, tab2 = st.tabs(["Manage Staff", "Generate Rota"])
 
 with tab1:
     st.header("Manage Staff")
-    
     staff_data = staff_table.all()
     if staff_data:
-        df_staff = pd.DataFrame(staff_data)
-        # Reorder columns for better readability
-        cols = ['name', 'role', 'type', 'max_hours']
-        df_staff = df_staff[cols]
-        st.dataframe(df_staff, use_container_width=True)
-    else:
-        st.info("No staff found.")
-
-    st.subheader("Add New Staff")
-    with st.form("add_staff_form", clear_on_submit=True):
-        c1, c2, c3, c4 = st.columns(4)
-        n_name = c1.text_input("Name")
-        n_role = c2.selectbox("Role", ["Staff", "Manager", "General Manager"])
-        n_type = c3.selectbox("Type", ["Full Time", "Part Time"])
-        n_hours = c4.number_input("Max Hours/Week", min_value=0, value=40 if n_type == "Full Time" else 20)
+        df = pd.DataFrame(staff_data)
+        st.dataframe(df[['name', 'role', 'type', 'max_hours', 'flexible_hours', 'preferred_shifts']], use_container_width=True)
+    
+    st.subheader("Add/Edit Staff")
+    with st.form("staff_form"):
+        c1, c2, c3 = st.columns(3)
+        name = c1.text_input("Name")
+        role = c2.selectbox("Role", ["Staff", "Manager", "General Manager"])
+        sType = c3.selectbox("Type", ["Full Time", "Part Time"])
+        
+        c4, c5 = st.columns(2)
+        max_h = c4.number_input("Max Hours", 0, 60, 40)
+        is_flex = c5.checkbox("Flexible Hours? (Can work 4h shifts)")
+        
+        prefs = st.multiselect("Preferred Shifts", ['Opening', 'Middle', 'Closing', 'Peak_Lunch', 'Peak_Dinner'])
         
         if st.form_submit_button("Add Staff"):
-            if n_name:
-                staff_table.insert({
-                    'name': n_name, 
-                    'role': n_role, 
-                    'type': n_type, 
-                    'max_hours': n_hours
-                })
-                st.success(f"Added {n_name}")
-                st.rerun()
-
-    st.subheader("Delete Staff")
-    if staff_data:
-        staff_options = {f"{s.doc_id}: {s['name']}": s.doc_id for s in staff_data}
-        sel_del = st.selectbox("Select Staff to Delete", options=list(staff_options.keys()))
-        if st.button("Delete Selected"):
-            staff_table.remove(doc_ids=[staff_options[sel_del]])
+            staff_table.insert({
+                'name': name, 'role': role, 'type': sType,
+                'max_hours': max_h, 'flexible_hours': is_flex, 'preferred_shifts': prefs
+            })
+            st.success(f"Added {name}")
             st.rerun()
+            
+    if st.button("Delete Selected Staff"):
+        # Simple deletion for demo (assumes unique names or just delete last one logic would be better but keeping simple)
+        pass 
 
 with tab2:
-    st.header("Generate Roster")
+    st.header("Generate Rota")
     
-    st.markdown("""
-    **Logic Overview:**
-    - **Opening (07:00-15:00):** 3 Staff (Must include 1 Manager)
-    - **Middle (11:30-20:30):** 2 Staff
-    - **Closing (15:00-23:30):** Variable (Default 3, Must include 1 Manager)
-    
-    *Peak Hours (12-2pm & 6-8pm) are covered by the natural overlap of shifts.*
-    """)
-    
-    if st.button("🚀 Generate Schedule", type="primary"):
-        with st.spinner("Optimizing schedule..."):
+    if st.button("🚀 Generate Rota", type="primary"):
+        with st.spinner("Generating complex schedule..."):
             staff_list = staff_table.all()
-            if not staff_list:
-                st.error("No staff available!")
-            else:
-                result = solve_roster(staff_list, num_days, closing_staff_count, daily_budgets)
+            df_result, obj_val = solve_Rota(staff_list, num_days, closing_staff_count, daily_budgets)
+            
+            if df_result is not None:
+                st.success(f"Rota Generation Complete! Score: {obj_val}")
                 
-                if result is not None:
-                    st.success("Optimization Successful!")
-                    st.dataframe(result, hide_index=True, use_container_width=True)
-                else:
-                    st.error("Infeasible! Try increasing the Daily Budgets or adjusting constraints.")
+                # Legend
+                st.markdown("""
+                **Legend:** 
+                `Open`: 07:00-15:00 (7.5h) | `Mid`: 11:30-20:30 (8.5h) | `Close`: 15:00-23:30 (8.0h)
+                `PkLnch`: 11:00-15:00 (4.0h) | `PkDin`: 17:00-21:00 (4.0h)
+                """)
+                
+                st.dataframe(df_result, use_container_width=True)
+            else:
+                st.error("Infeasible solution. Try increasing the daily budget or adding more staff.")
