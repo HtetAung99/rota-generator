@@ -63,7 +63,7 @@ init_db()
 
 # --- 2. The Logic (OR-Tools) ---
 
-def solve_Rota(staff_list, num_days, closing_shift_count, daily_budgets):
+def solve_Rota(staff_list, num_days, closing_shift_counts, daily_budgets):
     """
     V3 Solver: Maximizes budget utilization and handles complex constraints.
     """
@@ -112,7 +112,7 @@ def solve_Rota(staff_list, num_days, closing_shift_count, daily_budgets):
         # 1. Standard Shift Counts (Fixed)
         model.Add(sum(shifts[(s.doc_id, d, 0)] for s in staff_list) == 3) # Opening
         model.Add(sum(shifts[(s.doc_id, d, 1)] for s in staff_list) == 2) # Middle
-        model.Add(sum(shifts[(s.doc_id, d, 2)] for s in staff_list) == closing_shift_count) # Closing
+        model.Add(sum(shifts[(s.doc_id, d, 2)] for s in staff_list) == closing_shift_counts[d % 7]) # Closing
 
         # 2. Peak Hour Coverage
         # 12:00-14:00 (Lunch): Covered by Open(0), Mid(1), Peak_Lunch(3)
@@ -129,9 +129,12 @@ def solve_Rota(staff_list, num_days, closing_shift_count, daily_budgets):
 
         # 4. Daily Budget
         daily_budget_val = daily_budgets[d % 7]
+        # Calculate cost ONLY for non-General Managers
         daily_cost_scaled = sum(
             shifts[(s.doc_id, d, sh)] * SHIFT_HOURS_SCALED[sh]
-            for s in staff_list for sh in SHIFT_INDICES
+            for s in staff_list 
+            if s['role'] != 'General Manager'
+            for sh in SHIFT_INDICES
         )
         model.Add(daily_cost_scaled <= int(daily_budget_val * 10))
 
@@ -211,11 +214,15 @@ def solve_Rota(staff_list, num_days, closing_shift_count, daily_budgets):
             data.append(row)
             
         # Summary Row (Budget Usage)
-        summary_row = {'Staff': 'DAILY TOTAL (Hrs)'}
+        summary_row = {'Staff': 'DAILY TOTAL (Hrs) [Excl. GM]'}
         grand_total = 0
         for d in range(num_days):
             d_total = 0
             for s in staff_list:
+                # Exclude General Manager from budget calculation display to match solver logic
+                if s['role'] == 'General Manager':
+                    continue
+                    
                 for sh in SHIFT_INDICES:
                     if solver.Value(shifts[(s.doc_id, d, sh)]):
                         d_total += SHIFT_HOURS[sh]
@@ -237,13 +244,27 @@ st.title("⚡ Rota Generator: Advanced Scheduling")
 # Sidebar
 st.sidebar.header("Configuration")
 num_days = st.sidebar.number_input("Days to Schedule", 1, 14, 7)
-closing_staff_count = st.sidebar.number_input("Closing Shift Staff", 1, 10, 3)
+
+with st.sidebar.expander("Closing Shift Staff Counts", expanded=False):
+    closing_shift_counts = []
+    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    default_closing_counts = {
+        "Monday": 3, "Tuesday": 3, "Wednesday": 3, "Thursday": 3,
+        "Friday": 4, "Saturday": 4, "Sunday": 3
+    }
+    for day in days:
+        val = st.number_input(f"{day} Closing Staff", 1, 10, default_closing_counts[day], key=f"csc_{day}")
+        closing_shift_counts.append(val)
 
 with st.sidebar.expander("Daily Hour Budgets", expanded=False):
     daily_budgets = []
     days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    default_budgets = {
+        "Monday": 60.0, "Tuesday": 60.0, "Wednesday": 60.0,
+        "Thursday": 64.0, "Friday": 67.0, "Saturday": 67.0, "Sunday": 64.0
+    }
     for day in days:
-        val = st.number_input(f"{day}", 40.0, 100.0, 75.0, step=0.5, key=f"b_{day}")
+        val = st.number_input(f"{day}", 40.0, 100.0, default_budgets[day], step=0.5, key=f"b_{day}")
         daily_budgets.append(val)
 
 if st.sidebar.button("⚠️ Reset & Seed Database"):
@@ -257,8 +278,56 @@ with tab1:
     st.header("Manage Staff")
     staff_data = staff_table.all()
     if staff_data:
+        # Prepare DataFrame with doc_id
         df = pd.DataFrame(staff_data)
-        st.dataframe(df[['name', 'role', 'type', 'max_hours', 'flexible_hours', 'preferred_shifts']], use_container_width=True)
+        # Ensure doc_id is available but maybe hidden in editor or just disabled
+        df['doc_id'] = [s.doc_id for s in staff_data]
+        
+        # Columns to display/edit
+        cols = ['doc_id', 'name', 'role', 'type', 'max_hours', 'flexible_hours', 'preferred_shifts']
+        df = df[cols]
+
+        st.info("💡 You can edit staff details (like Max Hours) directly in the table below.")
+        
+        # Use data_editor
+        edited_df = st.data_editor(
+            df, 
+            use_container_width=True,
+            column_config={
+                "doc_id": st.column_config.NumberColumn("ID", disabled=True),
+                "max_hours": st.column_config.NumberColumn("Max Hours", min_value=0, max_value=80),
+                "preferred_shifts": st.column_config.ListColumn("Preferred Shifts")
+            },
+            hide_index=True
+        )
+
+        # Check for changes and update DB
+        # This compares the current state of edited_df with the original data
+        # A simpler way with TinyDB is to iterate and update if changed, 
+        # but for this scale, we can just button trigger or auto-update if we track state.
+        # Let's use a button to "Save Changes" to be explicit and safe, 
+        # OR just update on interaction if we want to be fancy. 
+        # For simplicity and robustness:
+        
+        if st.button("💾 Save Changes to Database"):
+            updated_count = 0
+            for index, row in edited_df.iterrows():
+                doc_id = row['doc_id']
+                # Construct update dict (excluding doc_id)
+                update_data = {
+                    'name': row['name'],
+                    'role': row['role'],
+                    'type': row['type'],
+                    'max_hours': row['max_hours'],
+                    'flexible_hours': row['flexible_hours'],
+                    'preferred_shifts': row['preferred_shifts']
+                }
+                staff_table.update(update_data, doc_ids=[doc_id])
+                updated_count += 1
+            st.success(f"Updated {updated_count} staff records!")
+            st.rerun()
+    else:
+        st.info("No staff found.")
     
     st.subheader("Add/Edit Staff")
     with st.form("staff_form"):
@@ -291,7 +360,7 @@ with tab2:
     if st.button("🚀 Generate Rota", type="primary"):
         with st.spinner("Generating complex schedule..."):
             staff_list = staff_table.all()
-            df_result, obj_val = solve_Rota(staff_list, num_days, closing_staff_count, daily_budgets)
+            df_result, obj_val = solve_Rota(staff_list, num_days, closing_shift_counts, daily_budgets)
             
             if df_result is not None:
                 st.success(f"Rota Generation Complete! Score: {obj_val}")
