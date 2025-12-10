@@ -3,8 +3,8 @@ from tinydb import TinyDB, Query
 import pandas as pd
 from ortools.sat.python import cp_model
 import os
-
 import json
+from datetime import datetime, timedelta
 
 # --- 1. Data Storage & Initialization ---
 
@@ -22,6 +22,7 @@ def get_db():
 
 db = get_db()
 staff_table = db.table('staff')
+requests_table = db.table('requests')
 
 def init_db(force_reset=False):
     """
@@ -40,6 +41,7 @@ def init_db(force_reset=False):
 
         if force_reset or len(staff_table.all()) == 0 or needs_migration:
             db.drop_table('staff')
+            db.drop_table('requests') # Clear requests on reset too
             
             staff_data = []
             
@@ -89,22 +91,15 @@ init_db()
 
 # --- 2. The Logic (OR-Tools) ---
 
-def solve_Rota(staff_list, num_days, closing_shift_counts, daily_budgets):
+def solve_Rota(staff_list, num_days, closing_shift_counts, daily_budgets, start_date, requests_list):
     """
-    V3 Solver: Maximizes budget utilization and handles complex constraints.
+    V3 Solver: Maximizes budget utilization, handles complex constraints & User Requests.
     """
     model = cp_model.CpModel()
     shifts = {}
 
     # --- Definitions ---
-    # 0: Opening (07:00-15:00) -> 7.5h
-    # 1: Middle  (11:30-20:30) -> 8.5h
-    # 2: Closing (15:00-23:30) -> 8.0h
-    # 3: Peak_Lunch (11:00-15:00) -> 4.0h
-    # 4: Peak_Dinner (17:00-21:00) -> 4.0h
-    
     SHIFT_INDICES = list(range(5))
-    STANDARD_SHIFTS = [0, 1, 2]
     FLEX_SHIFTS = [3, 4]
     
     SHIFT_HOURS = {0: 7.5, 1: 8.5, 2: 8.0, 3: 4.0, 4: 4.0}
@@ -112,11 +107,11 @@ def solve_Rota(staff_list, num_days, closing_shift_counts, daily_budgets):
     SHIFT_HOURS_SCALED = {k: int(v * 10) for k, v in SHIFT_HOURS.items()}
     
     SHIFT_CODES = {0: "Open", 1: "Mid", 2: "Close", 3: "PkLnch", 4: "PkDin"}
-    SHIFT_NAMES_FULL = {
-        0: "Opening (7.5h)", 1: "Middle (8.5h)", 2: "Closing (8.0h)",
-        3: "Peak Lunch (4h)", 4: "Peak Dinner (4h)"
+    SHIFT_NAMES_MAP = {
+        "Opening": 0, "Middle": 1, "Closing": 2, 
+        "Peak Lunch": 3, "Peak Dinner": 4
     }
-
+    
     # Map string preferences to indices
     PREF_MAP = {
         'Opening': 0, 'Middle': 1, 'Closing': 2, 
@@ -124,13 +119,77 @@ def solve_Rota(staff_list, num_days, closing_shift_counts, daily_budgets):
     }
 
     manager_ids = [s.doc_id for s in staff_list if s['role'] in ['Manager', 'General Manager']]
-    flexible_staff_ids = [s.doc_id for s in staff_list if s.get('flexible_hours', False)]
+    
+    # Generate mapping for dates and weekdays
+    # date_to_day_idx: '2025-12-25' -> 3
+    # weekday_to_day_indices: 'Monday' -> [0, 7] (if 14 day schedule)
+    
+    date_to_day_idx = {}
+    weekday_to_day_indices = {k: [] for k in ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]}
+    
+    current_dt = start_date
+    for d in range(num_days):
+        d_str = current_dt.strftime("%Y-%m-%d")
+        w_str = current_dt.strftime("%A")
+        
+        date_to_day_idx[d_str] = d
+        weekday_to_day_indices[w_str].append(d)
+        
+        current_dt += timedelta(days=1)
 
     # --- Variables ---
     for s in staff_list:
         for d in range(num_days):
             for sh in SHIFT_INDICES:
                 shifts[(s.doc_id, d, sh)] = model.NewBoolVar(f's{s.doc_id}_d{d}_sh{sh}')
+
+    # --- User Requests (Hard Rules) ---
+    for req in requests_list:
+        s_name = req['staff_name']
+        # Find staff doc_id
+        staff_obj = next((s for s in staff_list if s['name'] == s_name), None)
+        if not staff_obj:
+            continue
+        s_id = staff_obj.doc_id
+        
+        req_type = req['request_type']
+        val = req['value']
+        
+        # 1. OFF_SPECIFIC_DATE
+        if req_type == 'OFF_SPECIFIC_DATE':
+            if val in date_to_day_idx:
+                d = date_to_day_idx[val]
+                model.Add(sum(shifts[(s_id, d, sh)] for sh in SHIFT_INDICES) == 0)
+                
+        # 2. OFF_RECURRING_DAY
+        elif req_type == 'OFF_RECURRING_DAY':
+            if val in weekday_to_day_indices:
+                for d in weekday_to_day_indices[val]:
+                    model.Add(sum(shifts[(s_id, d, sh)] for sh in SHIFT_INDICES) == 0)
+
+        # 3. WORK_SPECIFIC_SHIFT (Specific Date)
+        elif req_type == 'WORK_SPECIFIC_SHIFT':
+            # Value format expected: "2025-12-25 | Opening"
+            try:
+                date_part, shift_name = val.split(" | ")
+                if date_part in date_to_day_idx and shift_name in SHIFT_NAMES_MAP:
+                    d = date_to_day_idx[date_part]
+                    sh_idx = SHIFT_NAMES_MAP[shift_name]
+                    model.Add(shifts[(s_id, d, sh_idx)] == 1)
+            except ValueError:
+                pass # Invalid format ignored
+
+        # 4. WORK_RECURRING_SHIFT
+        elif req_type == 'WORK_RECURRING_SHIFT':
+            # Value format expected: "Monday | Opening"
+            try:
+                day_name, shift_name = val.split(" | ")
+                if day_name in weekday_to_day_indices and shift_name in SHIFT_NAMES_MAP:
+                    sh_idx = SHIFT_NAMES_MAP[shift_name]
+                    for d in weekday_to_day_indices[day_name]:
+                        model.Add(shifts[(s_id, d, sh_idx)] == 1)
+            except ValueError:
+                pass
 
     # --- Hard Constraints ---
 
@@ -141,21 +200,18 @@ def solve_Rota(staff_list, num_days, closing_shift_counts, daily_budgets):
         model.Add(sum(shifts[(s.doc_id, d, 2)] for s in staff_list) == closing_shift_counts[d % 7]) # Closing
 
         # 2. Peak Hour Coverage
-        # 12:00-14:00 (Lunch): Covered by Open(0), Mid(1), Peak_Lunch(3)
         lunch_staff = sum(shifts[(s.doc_id, d, sh)] for s in staff_list for sh in [0, 1, 3])
         model.Add(lunch_staff >= 5)
 
-        # 18:00-20:00 (Dinner): Covered by Mid(1), Close(2), Peak_Dinner(4)
         dinner_staff = sum(shifts[(s.doc_id, d, sh)] for s in staff_list for sh in [1, 2, 4])
         model.Add(dinner_staff >= 5)
 
-        # 3. Manager Coverage (Opening & Closing)
+        # 3. Manager Coverage
         model.Add(sum(shifts[(m_id, d, 0)] for m_id in manager_ids) >= 1)
         model.Add(sum(shifts[(m_id, d, 2)] for m_id in manager_ids) >= 1)
 
-        # 4. Daily Budget
+        # 4. Daily Budget (Excl. GM)
         daily_budget_val = daily_budgets[d % 7]
-        # Calculate cost ONLY for non-General Managers
         daily_cost_scaled = sum(
             shifts[(s.doc_id, d, sh)] * SHIFT_HOURS_SCALED[sh]
             for s in staff_list 
@@ -166,7 +222,7 @@ def solve_Rota(staff_list, num_days, closing_shift_counts, daily_budgets):
 
     # 5. Staff Constraints
     for s in staff_list:
-        # Flex Shift Eligibility: Only 'flexible_hours' staff can work shifts 3 and 4
+        # Flex Eligibility
         if not s.get('flexible_hours', False):
             for d in range(num_days):
                 for sh in FLEX_SHIFTS:
@@ -183,16 +239,11 @@ def solve_Rota(staff_list, num_days, closing_shift_counts, daily_budgets):
         )
         model.Add(total_hours_scaled <= int(s['max_hours'] * 10))
 
-        # "Clopening" Rule: No Closing(2) on Day D and Opening(0) on Day D+1
+        # "Clopening" Rule
         for d in range(num_days - 1):
             model.Add(shifts[(s.doc_id, d, 2)] + shifts[(s.doc_id, d + 1, 0)] <= 1)
 
     # --- Objective Function ---
-    # Maximize (Total Hours Worked * Weight1) + (Preferred Shifts * Weight2)
-    
-    # Weighting: We want to prioritize using the budget (Total Hours) significantly.
-    # But we also want to respect preferences where possible.
-    
     obj_hours = sum(
         shifts[(s.doc_id, d, sh)] * SHIFT_HOURS_SCALED[sh]
         for s in staff_list for d in range(num_days) for sh in SHIFT_INDICES
@@ -204,13 +255,8 @@ def solve_Rota(staff_list, num_days, closing_shift_counts, daily_budgets):
         for p_str in prefs:
             if p_str in PREF_MAP:
                 p_idx = PREF_MAP[p_str]
-                # Add 1 bonus point for every preferred shift assigned
                 obj_prefs += sum(shifts[(s.doc_id, d, p_idx)] for d in range(num_days))
 
-    # Maximize
-    # Scaling preferences up to make them relevant against hours (which are in ~3000 range)
-    # 1 preference met ~= 2 hours of work value? 
-    # Let's say 1 hour = 10 units. 1 pref = 20 units.
     model.Maximize(obj_hours + (obj_prefs * 20))
 
     # --- Solve ---
@@ -220,11 +266,15 @@ def solve_Rota(staff_list, num_days, closing_shift_counts, daily_budgets):
 
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         data = []
-        DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         
-        # Create a grid: Rows = Staff, Cols = Days
-        # This visualization is better for complex shifts than Rows=Shifts
-        
+        # Build list of day labels for the columns
+        # e.g. "Mon 25 Dec"
+        day_headers = []
+        curr = start_date
+        for _ in range(num_days):
+            day_headers.append(curr.strftime("%a %d"))
+            curr += timedelta(days=1)
+            
         for s in staff_list:
             row = {'Staff': f"{s['name']} ({s['role']})"}
             total_h = 0
@@ -235,26 +285,23 @@ def solve_Rota(staff_list, num_days, closing_shift_counts, daily_budgets):
                         cell_val = SHIFT_CODES[sh]
                         total_h += SHIFT_HOURS[sh]
                         break
-                row[DAY_NAMES[d % 7]] = cell_val
+                row[day_headers[d]] = cell_val
             row['Total Hours'] = total_h
             data.append(row)
             
-        # Summary Row (Budget Usage)
+        # Summary Row
         summary_row = {'Staff': 'DAILY TOTAL (Hrs) [Excl. GM]'}
         grand_total = 0
         for d in range(num_days):
             d_total = 0
             for s in staff_list:
-                # Exclude General Manager from budget calculation display to match solver logic
-                if s['role'] == 'General Manager':
-                    continue
-                    
+                if s['role'] == 'General Manager': continue
                 for sh in SHIFT_INDICES:
                     if solver.Value(shifts[(s.doc_id, d, sh)]):
                         d_total += SHIFT_HOURS[sh]
             grand_total += d_total
             budget = daily_budgets[d % 7]
-            summary_row[DAY_NAMES[d % 7]] = f"{d_total} / {budget}"
+            summary_row[day_headers[d]] = f"{d_total} / {budget}"
         summary_row['Total Hours'] = grand_total
         data.append(summary_row)
 
@@ -269,27 +316,36 @@ st.title("⚡ Rota Generator: Advanced Scheduling")
 
 # Sidebar
 st.sidebar.header("Configuration")
-num_days = st.sidebar.number_input("Days to Schedule", 1, 14, 7)
+
+# Calculate next Monday
+today = datetime.now().date()
+days_until_monday = (0 - today.weekday() + 7) % 7 # Monday is weekday 0
+next_monday = today + timedelta(days=days_until_monday)
+
+st.sidebar.markdown(f"**Schedule for week starting:** `{next_monday.strftime('%A, %Y-%m-%d')}`")
+start_date_dt = datetime.combine(next_monday, datetime.min.time()) # Ensure it's a datetime object
+
+num_days = 7 # Always schedule for 7 days
+st.sidebar.caption(f"Scheduling for {num_days} days automatically.")
 
 with st.sidebar.expander("Closing Shift Staff Counts", expanded=False):
     closing_shift_counts = []
-    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    days_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     default_closing_counts = {
         "Monday": 3, "Tuesday": 3, "Wednesday": 3, "Thursday": 3,
         "Friday": 4, "Saturday": 4, "Sunday": 3
     }
-    for day in days:
+    for day in days_names:
         val = st.number_input(f"{day} Closing Staff", 1, 10, default_closing_counts[day], key=f"csc_{day}")
         closing_shift_counts.append(val)
 
 with st.sidebar.expander("Daily Hour Budgets", expanded=False):
     daily_budgets = []
-    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     default_budgets = {
         "Monday": 60.0, "Tuesday": 60.0, "Wednesday": 60.0,
         "Thursday": 64.0, "Friday": 67.0, "Saturday": 67.0, "Sunday": 64.0
     }
-    for day in days:
+    for day in days_names:
         val = st.number_input(f"{day}", 40.0, 100.0, default_budgets[day], step=0.5, key=f"b_{day}")
         daily_budgets.append(val)
 
@@ -298,24 +354,19 @@ if st.sidebar.button("⚠️ Reset & Seed Database"):
     st.rerun()
 
 # Tabs
-tab1, tab2 = st.tabs(["Manage Staff", "Generate Rota"])
+tab1, tab2, tab3 = st.tabs(["Manage Staff", "Requests & Availability", "Generate Rota"])
 
+# --- TAB 1: Manage Staff ---
 with tab1:
     st.header("Manage Staff")
     staff_data = staff_table.all()
     if staff_data:
-        # Prepare DataFrame with doc_id
         df = pd.DataFrame(staff_data)
-        # Ensure doc_id is available but maybe hidden in editor or just disabled
         df['doc_id'] = [s.doc_id for s in staff_data]
-        
-        # Columns to display/edit
         cols = ['doc_id', 'name', 'role', 'type', 'max_hours', 'flexible_hours', 'preferred_shifts']
         df = df[cols]
 
-        st.info("💡 You can edit staff details (like Max Hours) directly in the table below.")
-        
-        # Use data_editor
+        st.info("💡 You can edit staff details directly in the table below.")
         edited_df = st.data_editor(
             df, 
             use_container_width=True,
@@ -327,25 +378,13 @@ with tab1:
             hide_index=True
         )
 
-        # Check for changes and update DB
-        # This compares the current state of edited_df with the original data
-        # A simpler way with TinyDB is to iterate and update if changed, 
-        # but for this scale, we can just button trigger or auto-update if we track state.
-        # Let's use a button to "Save Changes" to be explicit and safe, 
-        # OR just update on interaction if we want to be fancy. 
-        # For simplicity and robustness:
-        
         if st.button("💾 Save Changes to Database"):
             updated_count = 0
             for index, row in edited_df.iterrows():
                 doc_id = row['doc_id']
-                # Construct update dict (excluding doc_id)
                 update_data = {
-                    'name': row['name'],
-                    'role': row['role'],
-                    'type': row['type'],
-                    'max_hours': row['max_hours'],
-                    'flexible_hours': row['flexible_hours'],
+                    'name': row['name'], 'role': row['role'], 'type': row['type'],
+                    'max_hours': row['max_hours'], 'flexible_hours': row['flexible_hours'],
                     'preferred_shifts': row['preferred_shifts']
                 }
                 staff_table.update(update_data, doc_ids=[doc_id])
@@ -355,17 +394,16 @@ with tab1:
     else:
         st.info("No staff found.")
     
-    st.subheader("Add/Edit Staff")
+    st.divider()
+    st.subheader("Add New Staff")
     with st.form("staff_form"):
         c1, c2, c3 = st.columns(3)
         name = c1.text_input("Name")
         role = c2.selectbox("Role", ["Staff", "Manager", "General Manager"])
         sType = c3.selectbox("Type", ["Full Time", "Part Time"])
-        
         c4, c5 = st.columns(2)
         max_h = c4.number_input("Max Hours", 0, 60, 40)
-        is_flex = c5.checkbox("Flexible Hours? (Can work 4h shifts)")
-        
+        is_flex = c5.checkbox("Flexible Hours?")
         prefs = st.multiselect("Preferred Shifts", ['Opening', 'Middle', 'Closing', 'Peak_Lunch', 'Peak_Dinner'])
         
         if st.form_submit_button("Add Staff"):
@@ -375,23 +413,110 @@ with tab1:
             })
             st.success(f"Added {name}")
             st.rerun()
-            
-    if st.button("Delete Selected Staff"):
-        # Simple deletion for demo (assumes unique names or just delete last one logic would be better but keeping simple)
-        pass 
 
+# --- TAB 2: Requests ---
 with tab2:
+    st.header("Requests & Availability")
+    
+    st.subheader("Add New Request")
+    
+    # 1. Inputs outside form to allow interactivity
+    staff_names = [s['name'] for s in staff_table.all()]
+    
+    c1, c2 = st.columns(2)
+    r_staff = c1.selectbox("Staff Member", staff_names)
+    r_type = c2.selectbox("Request Type", [
+        "OFF_SPECIFIC_DATE", "OFF_RECURRING_DAY", 
+        "WORK_SPECIFIC_SHIFT", "WORK_RECURRING_SHIFT"
+    ])
+    
+    # 2. Dynamic inputs based on type (Immediate update)
+    r_value = ""
+    days_list = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    shifts_list = ["Opening", "Middle", "Closing", "Peak Lunch", "Peak Dinner"]
+    
+    # Use a container for the conditional inputs to keep layout clean
+    with st.container():
+        c3, c4 = st.columns(2)
+        
+        if r_type == "OFF_SPECIFIC_DATE":
+            date_val = c3.date_input("Select Date", min_value=today)
+            r_value = date_val.strftime("%Y-%m-%d")
+            
+        elif r_type == "OFF_RECURRING_DAY":
+            day_val = c3.selectbox("Select Day", days_list)
+            r_value = day_val
+            
+        elif r_type == "WORK_SPECIFIC_SHIFT":
+            date_val = c3.date_input("Select Date", min_value=today)
+            shift_val = c4.selectbox("Select Shift", shifts_list)
+            r_value = f"{date_val.strftime('%Y-%m-%d')} | {shift_val}"
+            
+        elif r_type == "WORK_RECURRING_SHIFT":
+            day_val = c3.selectbox("Select Day", days_list)
+            shift_val = c4.selectbox("Select Shift", shifts_list)
+            r_value = f"{day_val} | {shift_val}"
+            
+    # 3. Add Button
+    if st.button("Add Rule", type="primary"):
+        requests_table.insert({
+            'staff_name': r_staff,
+            'request_type': r_type,
+            'value': r_value
+        })
+        st.success("Rule Added!")
+        st.rerun()
+            
+    # Display Active Rules
+    st.subheader("Active Rules")
+    reqs = requests_table.all()
+    if reqs:
+        # Show as simple table with Delete button
+        for r in reqs:
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                display_value = r['value']
+                if r['request_type'] in ['OFF_SPECIFIC_DATE', 'WORK_SPECIFIC_SHIFT']:
+                    try:
+                        # Extract date part. For WORK_SPECIFIC_SHIFT it's "YYYY-MM-DD | Shift"
+                        date_str_part = r['value'].split(" | ")[0]
+                        date_obj = datetime.strptime(date_str_part, "%Y-%m-%d").date()
+                        day_name = date_obj.strftime("%A")
+                        # Reconstruct display value
+                        if r['request_type'] == 'OFF_SPECIFIC_DATE':
+                            display_value = f"{date_str_part} ({day_name})"
+                        else: # WORK_SPECIFIC_SHIFT
+                            shift_name = r['value'].split(" | ")[1]
+                            display_value = f"{date_str_part} ({day_name}) | {shift_name}"
+                    except (ValueError, IndexError):
+                        # Fallback if date parsing or split fails
+                        pass
+                st.write(f"**{r['staff_name']}** - {r['request_type']}: `{display_value}`")
+            with col2:
+                if st.button("Delete", key=f"del_{r.doc_id}"):
+                    requests_table.remove(doc_ids=[r.doc_id])
+                    st.rerun()
+    else:
+        st.info("No active requests.")
+
+# --- TAB 3: Generate Rota ---
+with tab3:
     st.header("Generate Rota")
     
     if st.button("🚀 Generate Rota", type="primary"):
         with st.spinner("Generating complex schedule..."):
             staff_list = staff_table.all()
-            df_result, obj_val = solve_Rota(staff_list, num_days, closing_shift_counts, daily_budgets)
+            requests_list = requests_table.all()
+            
+            # Pass start_date and requests to solver
+            df_result, obj_val = solve_Rota(
+                staff_list, num_days, closing_shift_counts, daily_budgets, 
+                start_date_dt, requests_list
+            )
             
             if df_result is not None:
                 st.success(f"Rota Generation Complete! Score: {obj_val}")
                 
-                # Legend
                 st.markdown("""
                 **Legend:** 
                 `Open`: 07:00-15:00 (7.5h) | `Mid`: 11:30-20:30 (8.5h) | `Close`: 15:00-23:30 (8.0h)
@@ -400,4 +525,4 @@ with tab2:
                 
                 st.dataframe(df_result, use_container_width=True)
             else:
-                st.error("Infeasible solution. Try increasing the daily budget or adding more staff.")
+                st.error("Infeasible solution. Check for conflicting requests or budget constraints.")
